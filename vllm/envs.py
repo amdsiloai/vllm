@@ -207,6 +207,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE: bool = True
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
@@ -1420,6 +1421,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_FP8_MFMA_PAGE_ATTN": lambda: bool(
         int(os.getenv("VLLM_ROCM_FP8_MFMA_PAGE_ATTN", "0"))
     ),
+    # Use AITER Triton fused RoPE, zeros, and reshape_and_cache kernel
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE": lambda: bool(
+        int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE", "1"))
+    ),
     # Whether to use pytorch symmetric memory for allreduce
     "VLLM_ALLREDUCE_USE_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"))
@@ -1582,6 +1587,73 @@ def compile_factors() -> dict[str, object]:
 
     Start with every known vLLM env var; drop entries in `ignored_factors`;
     hash everything else. This keeps the cache key aligned across workers."""
+    # The values of envs may affects the computation graph.
+    # TODO(DefTruth): hash all environment variables?
+    # for key in environment_variables:
+    #     factorize(key)
+    environment_variables_to_hash = [
+        "VLLM_PP_LAYER_PARTITION",
+        "VLLM_MLA_DISABLE",
+        "VLLM_FLASH_ATTN_MAX_NUM_SPLITS_FOR_CUDA_GRAPH",
+        "VLLM_USE_TRITON_AWQ",
+        "VLLM_DP_RANK",
+        "VLLM_DP_SIZE",
+        "VLLM_USE_STANDALONE_COMPILE",
+        "VLLM_FUSED_MOE_CHUNK_SIZE",
+        "VLLM_FLASHINFER_MOE_BACKEND",
+        "VLLM_V1_USE_PREFILL_DECODE_ATTENTION",
+        "VLLM_ATTENTION_BACKEND",
+        "VLLM_USE_FLASHINFER_SAMPLER",
+        "VLLM_DISABLED_KERNELS",
+        "VLLM_USE_DEEP_GEMM",
+        "VLLM_MOE_USE_DEEP_GEMM",
+        "VLLM_USE_DEEP_GEMM_E8M0",
+        "VLLM_USE_FUSED_MOE_GROUPED_TOPK",
+        "VLLM_USE_FLASHINFER_MOE_FP16",
+        "VLLM_USE_FLASHINFER_MOE_FP8",
+        "VLLM_USE_FLASHINFER_MOE_FP4",
+        "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8",
+        "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS",
+        "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16",
+        "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE",
+        "VLLM_USE_CUDNN_PREFILL",
+        "VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL",
+        "VLLM_USE_TRTLLM_ATTENTION",
+        "VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION",
+        "VLLM_ROCM_USE_AITER",
+        "VLLM_ROCM_USE_AITER_PAGED_ATTN",
+        "VLLM_ROCM_USE_AITER_LINEAR",
+        "VLLM_ROCM_USE_AITER_MOE",
+        "VLLM_ROCM_USE_AITER_RMSNORM",
+        "VLLM_ROCM_USE_AITER_MLA",
+        "VLLM_ROCM_USE_AITER_MHA",
+        "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM",
+        "VLLM_ROCM_USE_AITER_TRITON_ROPE",
+        "VLLM_ROCM_USE_AITER_FP8BMM",
+        "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION",
+        "VLLM_ROCM_USE_AITER_TRITON_GEMM",
+        "VLLM_ROCM_USE_SKINNY_GEMM",
+        "VLLM_ROCM_FP8_PADDING",
+        "VLLM_ROCM_MOE_PADDING",
+        "VLLM_ROCM_CUSTOM_PAGED_ATTN",
+        "VLLM_ROCM_QUICK_REDUCE_QUANTIZATION",
+        "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16",
+        "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB",
+        "VLLM_ROCM_FP8_MFMA_PAGE_ATTN",
+        "VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE",
+        "VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE",
+        "VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING",
+        "VLLM_NVFP4_GEMM_BACKEND",
+        "VLLM_USE_FBGEMM",
+        "VLLM_DEEPEP_HIGH_THROUGHPUT_FORCE_INTRA_NODE",
+        "VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL",
+    ]
+    for key in environment_variables_to_hash:
+        # if this goes out of sync with environment_variables,
+        # it's not a user error, it's a bug
+        assert key in environment_variables, (
+            "Please update environment_variables_to_hash in envs.py"
+        )
 
     ignored_factors: set[str] = {
         "MAX_JOBS",

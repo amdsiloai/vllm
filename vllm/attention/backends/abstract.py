@@ -357,6 +357,7 @@ class AttentionImpl(ABC, Generic[T]):
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
