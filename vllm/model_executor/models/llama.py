@@ -70,6 +70,7 @@ from .utils import (
 
 from vllm.platforms import current_platform
 if current_platform.is_rocm():
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
     VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
 
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
@@ -231,6 +232,7 @@ class LlamaAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
+            rotary_emb=self.rotary_emb if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE else None,
         )
 
     def _get_llama_4_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
@@ -251,11 +253,15 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        if self.do_llama_4_scaling:
-            attn_scale = self._get_llama_4_attn_scale(positions)
-            q = (q * attn_scale).to(q.dtype)
-        attn_output = self.attn(q, k, v)
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+            assert not self.do_llama_4_scaling, "do_llama_4_scaling not supported right now"
+            attn_output = self.attn(q, k, v, positions=positions)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+            if self.do_llama_4_scaling:
+                attn_scale = self._get_llama_4_attn_scale(positions)
+                q = (q * attn_scale).to(q.dtype)
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
