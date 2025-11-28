@@ -36,7 +36,12 @@ if current_platform.is_rocm():
 
     from vllm.triton_utils import tl, triton
 
-    if envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
+        envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+    )
+
+    VLLM_ROCM_USE_AITER_TRITON_ROPE = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
         from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 
     def block_size(x, head_dim):
@@ -680,7 +685,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(0)
-        if positions is not None and query.shape[0] <= 256:
+        if positions is not None and query.shape[0] <= 256 and VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
             assert self.kv_sharing_target_layer_name is None, (
                 "self.kv_sharing_target_layer_name cannot be None"
             )
@@ -716,7 +721,10 @@ class AiterFlashAttentionImpl(AttentionImpl):
             )
         else:
             if positions is not None:
-                query, key = self.rotary_emb(positions, query, key)
+                if VLLM_ROCM_USE_AITER_TRITON_ROPE:
+                    query, key = self.rotary_emb.forward_cuda(positions, query, key)
+                else:
+                    query, key = self.rotary_emb(positions, query, key)
 
             if self.kv_sharing_target_layer_name is None:
                 # Reshape the input keys and values and store them in the cache.
