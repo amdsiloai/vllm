@@ -173,17 +173,41 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         from vllm import _custom_ops as ops
 
         self._match_cos_sin_cache_dtype(query)
-
-        # ops.rotary_embedding() is an in-place operation
-        # that updates the query and key tensors.
-        ops.rotary_embedding(
-            positions,
-            query,
-            key,
-            self.head_size,
-            self.cos_sin_cache,
-            self.is_neox_style,
-        )
+        if self.is_rocm_triton_rotary_embed_enabled:
+            assert key is not None
+            num_tokens = positions.numel()
+            cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+            query_shape = query.shape
+            key_shape = key.shape
+            query = query.view(num_tokens, -1, self.head_size)
+            key = key.view(num_tokens, -1, self.head_size)
+            query_ = query[..., :self.rotary_dim]
+            key_ = key[..., :self.rotary_dim]
+            rotate_style = 0 if self.is_neox_style else 1
+            positions = positions.view(*query.shape[:1])
+            torch.ops.vllm.rocm_aiter_rotary_emb_with_key_forward_triton(
+                positions,
+                sin,
+                cos,
+                query_,
+                key_,
+                None,
+                rotate_style,
+                False,
+            )
+            query = query.view(query_shape)
+            key = key.view(key_shape)
+        else:
+            # ops.rotary_embedding() is an in-place operation
+            # that updates the query and key tensors.
+            ops.rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
         return query, key
 
     def forward_hip(
