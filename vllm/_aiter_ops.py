@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 from collections.abc import Callable
+from typing import Optional
 
 import torch
 
@@ -431,6 +432,55 @@ def _rocm_aiter_rmsnorm2d_fwd_with_add_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(x), torch.empty_like(residual)
 
+def _rocm_aiter_rotary_emb_with_key_forward_triton_impl(
+    positions: torch.Tensor,
+    sin: torch.Tensor,
+    cos: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    offsets: Optional[torch.Tensor] = None,
+    rotate_style: int = 0,
+    is_nope_first: bool = False,
+) -> None:
+    import aiter.ops.triton.rope as ops
+    if offsets is None:
+        ops.rope_cached_thd_positions_2c_fwd_inplace(
+            query,
+            key,
+            cos,
+            sin,
+            positions,
+            rotate_style,
+            reuse_freqs_front_part=True,
+            nope_first=is_nope_first,
+        )
+    else:
+        ops.rope_cached_thd_positions_offsets_2c_fwd_inplace(
+            query,
+            key,
+            cos,
+            sin,
+            positions,
+            offsets,
+            rotate_style,
+            reuse_freqs_front_part=True,
+            nope_first=is_nope_first,
+        )
+
+
+def _rocm_aiter_rotary_emb_with_key_forward_triton_fake(
+    positions: torch.Tensor,
+    sin: torch.Tensor,
+    cos: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    offsets: Optional[torch.Tensor] = None,
+    rotate_style: int = 0,
+    is_nope_first: bool = False,
+) -> None:
+    pass
+
+
 
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
@@ -627,6 +677,14 @@ class rocm_aiter_ops:
                 op_func=_rocm_aiter_rmsnorm2d_fwd_with_add_impl,
                 mutates_args=[],
                 fake_impl=_rocm_aiter_rmsnorm2d_fwd_with_add_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_rotary_emb_with_key_forward_triton",
+                op_func=_rocm_aiter_rotary_emb_with_key_forward_triton_impl,
+                mutates_args=["key", "query"],
+                fake_impl=_rocm_aiter_rotary_emb_with_key_forward_triton_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
 
