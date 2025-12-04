@@ -133,6 +133,11 @@ class PassConfig:
     enable_qk_norm_rope_fusion: bool = False
     """Whether to enable the fused Q/K RMSNorm + RoPE pass."""
 
+    enable_aiter_allreduce_fusion: bool | None = None
+    """Whether to enable aiter allreduce + rmsnorm fusion (ROCm only).
+    If None (default), will be auto-enabled when VLLM_ROCM_USE_AITER=True 
+    and VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_RMSNORM=True."""
+
     # TODO(luka) better pass enabling system.
 
     def flashinfer_max_size(self, world_size: int) -> int | None:
@@ -191,6 +196,14 @@ class PassConfig:
                 "CUDA or ROCm. The fusion will be disabled."
             )
             self.enable_qk_norm_rope_fusion = False
+
+        # Auto-enable aiter allreduce fusion based on env vars if not explicitly set
+        if self.enable_aiter_allreduce_fusion is None:
+            self.enable_aiter_allreduce_fusion = (
+                current_platform.is_rocm()
+                and envs.VLLM_ROCM_USE_AITER
+                and envs.VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_RMSNORM
+            )
 
 
 @config

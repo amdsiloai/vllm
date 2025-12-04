@@ -1232,3 +1232,95 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
                 self.ipc_handles, self.group
             )
+
+
+if current_platform.is_rocm():
+    from vllm._aiter_ops import init_aiter_custom_allreduce, rocm_aiter_ops
+
+    class AiterAllReduceFusedAddRMSNormPattern(BasePattern):
+        """
+        Pattern: allreduce + fused_add_rms_norm → aiter fused kernel
+        Applies to o_proj and down_proj outputs followed by RMSNorm.
+        """
+
+        def __init__(
+            self,
+            epsilon: float,
+            dtype: torch.dtype,
+            device: str,
+        ):
+            super().__init__(dtype, device)
+            self.epsilon = epsilon
+            self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon)
+
+        def get_inputs(self):
+            input, residual, weight = self.rmsnorm_matcher.inputs()
+            return [residual, input.to(self.dtype), weight]
+
+        def register(self, pm_pass: PatternMatcherPass):
+            def pattern(residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor):
+                allreduce_output = tensor_model_parallel_all_reduce(input)
+                rms, residual = self.rmsnorm_matcher(allreduce_output, weight, residual)
+                return rms, residual
+
+            def replacement(
+                residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
+            ):
+                # Call the registered aiter op
+                rms_out, res_out = torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm(
+                    input,
+                    residual,
+                    weight,
+                    self.epsilon,
+                    self.tp.unique_name,
+                )
+                return rms_out, res_out
+
+            pm.register_replacement(
+                pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+            )
+
+    class AiterAllReduceFusionPass(VllmPatternMatcherPass):
+        """ROCm version of AllReduceFusionPass using aiter kernels."""
+
+        def __init__(self, config: VllmConfig):
+            super().__init__(config)
+            self.disabled = True
+            self.tp_size = get_tensor_model_parallel_world_size()
+
+            if self.tp_size <= 1:
+                return
+
+            if not rocm_aiter_ops.is_fused_allreduce_rmsnorm_enabled():
+                logger.debug("Aiter fused allreduce rmsnorm is disabled")
+                return
+
+            # Initialize aiter's CustomAllreduce NOW at compilation time.
+            # This avoids per-call function overhead during runtime inference.
+            if not init_aiter_custom_allreduce():
+                logger.warning(
+                    "Failed to initialize aiter CustomAllreduce. "
+                    "Fused allreduce+rmsnorm pass will be disabled."
+                )
+                return
+
+            self.patterns = PatternMatcherPass(pass_name="aiter_all_reduce_fusion_pass")
+            self.register_patterns()
+            self.disabled = False
+
+        @enable_fake_mode
+        def register_patterns(self):
+            for epsilon in [1e-5, 1e-6]:
+                AiterAllReduceFusedAddRMSNormPattern(
+                    epsilon, self.model_dtype, self.device
+                ).register(self.patterns)
+
+                # Clear pattern cache to allow multiple epsilons
+                torch._inductor.pattern_matcher._seen_patterns.clear()
+
+        @VllmInductorPass.time_and_log
+        def __call__(self, graph: fx.Graph):
+            if self.disabled:
+                return
+            self.matched_count = self.patterns.apply(graph)
+            logger.debug("Replaced %s patterns with aiter fused allreduce rmsnorm", self.matched_count)

@@ -481,6 +481,141 @@ def _rocm_aiter_rotary_emb_with_key_forward_triton_fake(
     pass
 
 
+# Module-level singleton for aiter's CustomAllreduce instance
+_AITER_CUSTOM_ALLREDUCE: Optional["AiterCustomAllreduce"] = None  # type: ignore
+_AITER_CA_INITIALIZED = False
+
+
+def init_aiter_custom_allreduce() -> bool:
+    """
+    Initialize aiter's CustomAllreduce instance using vLLM's TP group.
+    
+    This should be called ONCE during compilation pass initialization
+    (AiterAllReduceFusionPass.__init__), NOT during runtime kernel calls.
+    
+    Returns:
+        True if initialization succeeded and fused kernel is usable.
+        False if initialization failed or is not applicable.
+    
+    Thread-safe: uses global flag to prevent double initialization.
+    """
+    global _AITER_CUSTOM_ALLREDUCE, _AITER_CA_INITIALIZED
+    
+    if _AITER_CA_INITIALIZED:
+        return _AITER_CUSTOM_ALLREDUCE is not None
+    
+    _AITER_CA_INITIALIZED = True
+    
+    try:
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+            get_tp_group,
+        )
+        
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size <= 1:
+            # No need for custom allreduce with single GPU
+            return False
+        
+        tp_group = get_tp_group()
+        
+        # Import aiter's CustomAllreduce
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            CustomAllreduce as AiterCustomAllreduce,
+        )
+        
+        # Create aiter's CustomAllreduce using vLLM's TP group
+        # The cpu_group is used for coordination, device for the actual compute
+        _AITER_CUSTOM_ALLREDUCE = AiterCustomAllreduce(
+            group=tp_group.cpu_group,
+            device=tp_group.device,
+        )
+        
+        if _AITER_CUSTOM_ALLREDUCE.disabled:
+            _AITER_CUSTOM_ALLREDUCE = None
+            return False
+        
+        return True
+            
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Failed to initialize aiter CustomAllreduce: {e}. "
+            "Fused allreduce+rmsnorm will fall back to separate operations."
+        )
+        _AITER_CUSTOM_ALLREDUCE = None
+        return False
+
+
+def _rocm_aiter_fused_allreduce_rmsnorm_impl(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused AllReduce + RMSNorm kernel using aiter with vLLM's parallel state.
+    
+    This uses aiter's CustomAllreduce directly with vLLM's TP group,
+    bypassing aiter's parallel state management.
+    
+    IMPORTANT: init_aiter_custom_allreduce() must be called before this function
+    (done in AiterAllReduceFusionPass.__init__ at compilation time).
+    
+    Args:
+        inp: Input tensor to all-reduce [batch, hidden_dim]
+        res_inp: Residual input for skip connection [batch, hidden_dim]
+        weight: RMSNorm weight [hidden_dim]
+        eps: Epsilon for numerical stability
+        group_name: Name of the tensor parallel group (unused, kept for API compatibility)
+    
+    Returns:
+        (normalized_output, residual_output):
+        - normalized_output = RMSNorm(AllReduce(inp) + res_inp)
+        - residual_output = AllReduce(inp) + res_inp
+    """
+    # Direct global access - NO function call overhead.
+    # The singleton is initialized at compilation time by AiterAllReduceFusionPass.
+    aiter_ca = _AITER_CUSTOM_ALLREDUCE
+    
+    if aiter_ca is not None:
+        # Try to use the fused kernel
+        result = aiter_ca.custom_fused_ar_rms(inp, res_inp, weight, eps)
+        if result is not None:
+            return result
+    
+    # Fallback to separate operations using vLLM's infrastructure
+    from vllm.distributed import tensor_model_parallel_all_reduce
+    
+    allreduce_out = tensor_model_parallel_all_reduce(inp)
+    
+    # Use aiter's rmsnorm with add if available, otherwise use vLLM's
+    from aiter import rmsnorm2d_fwd_with_add
+    
+    residual_out = torch.empty_like(res_inp)
+    output = torch.empty_like(inp)
+    rmsnorm2d_fwd_with_add(
+        output,  # output
+        allreduce_out,  # input (allreduced)
+        res_inp,  # residual input
+        residual_out,  # residual output
+        weight,
+        eps,
+    )
+    return output, residual_out
+
+
+def _rocm_aiter_fused_allreduce_rmsnorm_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for torch.compile tracing."""
+    return torch.empty_like(inp), torch.empty_like(res_inp)
+
 
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
@@ -500,6 +635,8 @@ class rocm_aiter_ops:
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+    _FUSED_ALLREDUCE_RMSNORM = envs.VLLM_ROCM_USE_AITER_FUSED_ALLREDUCE_RMSNORM
+
 
     @classmethod
     @if_aiter_supported
@@ -579,6 +716,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_triton_gemm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._TRITON_UNQUANT_GEMM
+
+    @classmethod
+    @if_aiter_supported
+    def is_fused_allreduce_rmsnorm_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._FUSED_ALLREDUCE_RMSNORM
 
     @staticmethod
     @if_aiter_supported
@@ -685,6 +827,14 @@ class rocm_aiter_ops:
                 op_func=_rocm_aiter_rotary_emb_with_key_forward_triton_impl,
                 mutates_args=["key", "query"],
                 fake_impl=_rocm_aiter_rotary_emb_with_key_forward_triton_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_allreduce_rmsnorm",
+                op_func=_rocm_aiter_fused_allreduce_rmsnorm_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_allreduce_rmsnorm_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
 
@@ -1036,6 +1186,33 @@ class rocm_aiter_ops:
         from aiter.ops.shuffle import shuffle_weight
 
         return tuple(shuffle_weight(tensor, layout=layout) for tensor in tensors)
+
+    @staticmethod
+    def fused_allreduce_rmsnorm(
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        group_name: str = "",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Fused AllReduce + RMSNorm using aiter kernel with vLLM's parallel state.
+        
+        Args:
+            inp: Input tensor to all-reduce [batch, hidden_dim]
+            res_inp: Residual input for skip connection [batch, hidden_dim]
+            weight: RMSNorm weight [hidden_dim]
+            eps: Epsilon for numerical stability
+            group_name: Name of the tensor parallel group (optional)
+        
+        Returns:
+            (normalized_output, residual_output):
+            - normalized_output = RMSNorm(AllReduce(inp) + res_inp)
+            - residual_output = AllReduce(inp) + res_inp
+        """
+        return torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm(
+            inp, res_inp, weight, eps, group_name
+        )
 
 
 rocm_aiter_ops.register_ops_once()
