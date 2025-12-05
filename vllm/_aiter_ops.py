@@ -9,6 +9,12 @@ import torch
 import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_newer
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+logger.info("In _aiter_ops.py.")
 
 
 def is_aiter_found() -> bool:
@@ -500,6 +506,8 @@ def init_aiter_custom_allreduce() -> bool:
     Thread-safe: uses global flag to prevent double initialization.
     """
     global _AITER_CUSTOM_ALLREDUCE, _AITER_CA_INITIALIZED
+
+    logger.info(f"In init_aiter_custom_allreduce.")
     
     if _AITER_CA_INITIALIZED:
         return _AITER_CUSTOM_ALLREDUCE is not None
@@ -534,6 +542,8 @@ def init_aiter_custom_allreduce() -> bool:
         if _AITER_CUSTOM_ALLREDUCE.disabled:
             _AITER_CUSTOM_ALLREDUCE = None
             return False
+
+        logger.info(f"AiterCustomAllreduce initialized.")
         
         return True
             
@@ -575,16 +585,24 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
         - normalized_output = RMSNorm(AllReduce(inp) + res_inp)
         - residual_output = AllReduce(inp) + res_inp
     """
+    # this function is never called
+
+
     # Direct global access - NO function call overhead.
     # The singleton is initialized at compilation time by AiterAllReduceFusionPass.
     aiter_ca = _AITER_CUSTOM_ALLREDUCE
+
+    logger.info(f"BLAH In _rocm_aiter_fused_allreduce_rmsnorm_impl.")
     
     if aiter_ca is not None:
+        logger.info(f"aiter_ca is not None.")
         # Try to use the fused kernel
         result = aiter_ca.custom_fused_ar_rms(inp, res_inp, weight, eps)
         if result is not None:
+            logger.info(f"result is not None.")
             return result
     
+    logger.info(f"aiter_ca is None.")
     # Fallback to separate operations using vLLM's infrastructure
     from vllm.distributed import tensor_model_parallel_all_reduce
     

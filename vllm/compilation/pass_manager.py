@@ -107,6 +107,8 @@ class PostGradPassManager(CustomGraphPass):
                 self.passes += [AllReduceFusionPass(config)]
 
             if current_platform.is_rocm() and self.pass_config.enable_aiter_allreduce_fusion:
+                logger.info("FOOBAR Enabling aiter allreduce fusion.")
+
                 self.passes += [AiterAllReduceFusionPass(config)]
 
             if self.pass_config.enable_fusion:

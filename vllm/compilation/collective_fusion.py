@@ -1237,6 +1237,8 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 if current_platform.is_rocm():
     from vllm._aiter_ops import init_aiter_custom_allreduce, rocm_aiter_ops
 
+    logger.info("In collective_fusion.py current_platform.is_rocm()")
+
     class AiterAllReduceFusedAddRMSNormPattern(BasePattern):
         """
         Pattern: allreduce + fused_add_rms_norm → aiter fused kernel
@@ -1249,6 +1251,7 @@ if current_platform.is_rocm():
             dtype: torch.dtype,
             device: str,
         ):
+            logger.info("AiterAllReduceFusedAddRMSNormPattern init")
             super().__init__(dtype, device)
             self.epsilon = epsilon
             self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon)
@@ -1258,6 +1261,7 @@ if current_platform.is_rocm():
             return [residual, input.to(self.dtype), weight]
 
         def register(self, pm_pass: PatternMatcherPass):
+            logger.info("AiterAllReduceFusedAddRMSNormPattern register")
             def pattern(residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor):
                 allreduce_output = tensor_model_parallel_all_reduce(input)
                 rms, residual = self.rmsnorm_matcher(allreduce_output, weight, residual)
@@ -1284,6 +1288,7 @@ if current_platform.is_rocm():
         """ROCm version of AllReduceFusionPass using aiter kernels."""
 
         def __init__(self, config: VllmConfig):
+            logger.info("AiterAllReduceFusionPass init 2")
             super().__init__(config)
             self.disabled = True
             self.tp_size = get_tensor_model_parallel_world_size()
@@ -1320,6 +1325,7 @@ if current_platform.is_rocm():
 
         @VllmInductorPass.time_and_log
         def __call__(self, graph: fx.Graph):
+            logger.info("AiterAllReduceFusionPass @VllmInductorPass.time_and_log")
             if self.disabled:
                 return
             self.matched_count = self.patterns.apply(graph)
