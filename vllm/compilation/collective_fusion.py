@@ -1237,6 +1237,9 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 if current_platform.is_rocm():
     from vllm._aiter_ops import init_aiter_custom_allreduce, rocm_aiter_ops
 
+    AITER_RMS_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
+    AITER_RMS_ADD_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
+
     logger.info("In collective_fusion.py current_platform.is_rocm()")
 
     class AiterAllReduceFusedAddRMSNormPattern(BasePattern):
@@ -1258,17 +1261,26 @@ if current_platform.is_rocm():
 
         def get_inputs(self):
             input, residual, weight = self.rmsnorm_matcher.inputs()
-            return [residual, input.to(self.dtype), weight]
+            return [input.to(self.dtype), residual, weight]
 
         def register(self, pm_pass: PatternMatcherPass):
             logger.info("AiterAllReduceFusedAddRMSNormPattern register")
-            def pattern(residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor):
+            # def pattern(residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor):
+            def pattern(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor):                
                 allreduce_output = tensor_model_parallel_all_reduce(input)
-                rms, residual = self.rmsnorm_matcher(allreduce_output, weight, residual)
-                return rms, residual
+                # rms, residual = self.rmsnorm_matcher(allreduce_output, weight, residual)
+
+                at1 = AITER_RMS_ADD_OP(
+                    x=allreduce_output,
+                    residual=residual,
+                    weight=weight,
+                    variance_epsilon=self.epsilon,
+                )
+
+                return at1[0], at1[1]  # rms, residual
 
             def replacement(
-                residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
+                input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
             ):
                 # Call the registered aiter op
                 rms_out, res_out = torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm(
