@@ -1,0 +1,23 @@
+# Dockerfile for testing fused shared experts on ROCm (gfx950/MI3XX)
+# with Kimi-K2.5 MXFP4 and DeepSeek-family models.
+#
+# Includes:
+#   - Fused shared experts logging (deepseek_v2.py)
+#   - Persistent MLA kernel from AITER (#36574 / 978fc18)
+#   - MLA FP8 PS + CUDA graphs accuracy fix (PR #38719)
+#
+# Build (from the vLLM repo root):
+#   docker build -f docker/Dockerfile.rocm_kimi_fused_se \
+#       -t vllm-rocm-fused-se:latest .
+
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.18.1
+FROM ${BASE_IMAGE}
+
+COPY docker/patch_v0181.py /tmp/patch_v0181.py
+RUN python3 /tmp/patch_v0181.py && rm /tmp/patch_v0181.py
+
+RUN pip install hf_transfer
+
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
