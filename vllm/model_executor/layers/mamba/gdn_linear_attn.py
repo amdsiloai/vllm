@@ -25,8 +25,8 @@ from vllm.model_executor.layers.fla.ops import (
 )
 from vllm.model_executor.layers.fla.ops import (
     fused_post_conv_prep,
+    fused_rearrange_sigmoid_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
-    fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
 from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
@@ -46,6 +46,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_fast import (
+    causal_conv1d_update_fast,
+    fused_reshape_causal_conv1d_update_fast,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
@@ -166,8 +170,9 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_indices: torch.Tensor | None = None,
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
     ):
-        return fi_chunk_gated_delta_rule(
+        o, final_state = fi_chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -178,6 +183,11 @@ class ChunkGatedDeltaRule(CustomOp):
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
+        if core_attn_out is not None:
+            o_flat = o.squeeze(0).reshape(-1)
+            co_flat = core_attn_out.reshape(-1)
+            co_flat[: o_flat.numel()].copy_(o_flat)
+        return o, final_state
 
     def forward_native(
         self,
@@ -192,6 +202,7 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_indices: torch.Tensor | None = None,
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
     ):
         return fla_chunk_gated_delta_rule(
             q=q,
@@ -205,6 +216,7 @@ class ChunkGatedDeltaRule(CustomOp):
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
         )
 
 
@@ -479,6 +491,112 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
 
         return query, key, value, z, b, a
 
+    @torch.compile(fullgraph=True)
+    def prepare_gdn_attention_core_inputs(
+        self,
+        mixed_qkvz: torch.Tensor,
+        mixed_ba: torch.Tensor,
+        num_tokens: int,
+    ):
+        """
+        Derives mixed_qkv, z, b, a from projected qkvz/ba for the GDN custom op.
+
+        For gqa_interleaved_layout (Qwen3-Next): unpack the interleaved
+        [ng, (hk + hk + np/ng*hv + np/ng*hv)] layout into contiguous qkv.
+        For non-interleaved layout (Qwen3.5): simple split along last dim.
+        """
+        if not self.gqa_interleaved_layout:
+            # Qwen3.5: weights are in [q, k, v, z] order
+            assert num_tokens == mixed_qkvz.shape[0]
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+            z_size = self.value_dim // self.tp_size
+            mixed_qkv, z_flat = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            n = mixed_qkvz.shape[0]
+            z_out = z_flat.reshape(n, -1, self.head_v_dim)
+            b, a = mixed_ba.chunk(2, dim=-1)
+            return mixed_qkv, z_out, b, a
+
+        # Qwen3-Next: interleaved GQA layout
+        base_shape_qkvz = mixed_qkvz.size()[:-1]
+        base_shape_ba = mixed_ba.size()[:-1]
+        ng = self.num_k_heads // self.tp_size
+
+        new_tensor_shape_qkvz = base_shape_qkvz + (
+            ng,
+            (
+                self.head_k_dim
+                + self.head_k_dim
+                + (self.head_v_dim + self.head_v_dim)
+                * self.num_v_heads
+                // self.num_k_heads
+            ),
+        )
+        new_tensor_shape_ba = base_shape_ba + (
+            ng,
+            2 * self.num_v_heads // self.num_k_heads,
+        )
+
+        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
+        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
+
+        split_arg_list_qkvz = [
+            self.head_k_dim,
+            self.head_k_dim,
+            (self.num_v_heads // self.num_k_heads * self.head_v_dim),
+            (self.num_v_heads // self.num_k_heads * self.head_v_dim),
+        ]
+        split_arg_list_ba = [
+            self.num_v_heads // self.num_k_heads,
+            self.num_v_heads // self.num_k_heads,
+        ]
+
+        (query, key, value, z) = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=-1)
+        (b, a) = torch.split(mixed_ba, split_arg_list_ba, dim=-1)
+
+        mixed_qkv_logical = torch.cat(
+            [
+                query.reshape(num_tokens, -1),
+                key.reshape(num_tokens, -1),
+                value.reshape(num_tokens, -1),
+            ],
+            dim=-1,
+        )
+
+        fused = torch.cat(
+            [
+                mixed_qkv_logical.reshape(-1),
+                z.reshape(-1),
+                b.reshape(-1),
+                a.reshape(-1),
+            ],
+            dim=0,
+        )
+
+        curr = 0
+        qkv_numel = mixed_qkv_logical.numel()
+        z_numel = z.numel()
+        b_numel = b.numel()
+        a_numel = a.numel()
+
+        mixed_qkv_out = fused[curr : curr + qkv_numel].view(num_tokens, -1)
+        curr += qkv_numel
+
+        z_out = fused[curr : curr + z_numel].view(
+            num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim
+        )
+        curr += z_numel
+
+        b_out = fused[curr : curr + b_numel].view(
+            num_tokens, self.num_v_heads // self.tp_size
+        )
+        curr += b_numel
+
+        a_out = fused[curr : curr + a_numel].view(
+            num_tokens, self.num_v_heads // self.tp_size
+        )
+
+        return mixed_qkv_out, z_out, b_out, a_out
+
     def rearrange_mixed_qkv(self, mixed_qkv):
         if mixed_qkv is None:
             return None, None, None
@@ -520,37 +638,16 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        if hasattr(self, "in_proj_qkv"):
-            # LoRA path (Qwen3.5 only): separate in_proj_qkv and in_proj_z
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
-            z = z.reshape(z.size(0), -1, self.head_v_dim)
-            b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
+        if hasattr(self, "in_proj_qkvz"):
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-
-            if self.gqa_interleaved_layout:
-                # Qwen3-Next: unpack the interleaved GQA layout
-                query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                    mixed_qkvz, ba
-                )
-                query, key, value = map(
-                    lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-                )
-                mixed_qkv = torch.cat((query, key, value), dim=-1)
-            else:
-                # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
-                qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-                z_size = self.value_dim // self.tp_size
-                mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
-                z = z.reshape(z.size(0), -1, self.head_v_dim)
-                b, a = ba.chunk(2, dim=-1)
-                b = b.contiguous()
-                a = a.contiguous()
+            # LoRA path (Qwen3.5 only): separate qkv and z projections
+            qkv_proj, _ = self.in_proj_qkv(hidden_states)
+            z_proj, _ = self.in_proj_z(hidden_states)
+            projected_states_qkvz = torch.cat([qkv_proj, z_proj], dim=-1)
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        projected_states_qkvz = projected_states_qkvz.view(num_tokens, -1)
+        projected_states_ba = projected_states_ba.view(num_tokens, -1)
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -562,11 +659,16 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        z = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=projected_states_qkvz.dtype,
+            device=projected_states_qkvz.device,
+        )
 
         torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
+            projected_states_qkvz,
+            projected_states_ba,
+            z,
             core_attn_out,
             self.prefix,
         )
@@ -688,8 +790,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         ``BT = chunk_size`` (64).  A single warmup pass with T = 64
         is sufficient to populate the autotuner cache.
 
-        The decode path uses ``fused_sigmoid_gating_delta_rule_update``
-        which has fixed kernel parameters (no autotuning), so only the
+        The decode path uses ``fused_rearrange_sigmoid_gated_delta_rule``
+        with fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
         if hasattr(self, "_prefill_kernels_warmed_up"):
@@ -759,9 +861,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
 
     def _forward_core(
         self,
-        mixed_qkv: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
+        qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        z_out: torch.Tensor,
         core_attn_out: torch.Tensor,
     ):
         forward_context = get_forward_context()
@@ -770,12 +872,14 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         if attn_metadata is None:
             # V1 profile run — warm up prefill kernels so that
             # autotuning completes before KV cache allocation.
-            self._warmup_prefill_kernels(mixed_qkv)
+            self._warmup_prefill_kernels(qkvz)
             return
 
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
 
         if (
             self.enable_packed_recurrent_decode
@@ -783,10 +887,18 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):
+            num_tokens_all = qkvz.shape[0]
+            mixed_qkv, z_prep, b_prep, a_prep = self.prepare_gdn_attention_core_inputs(
+                qkvz, ba, num_tokens_all
+            )
+            z_out[:] = z_prep
+            mixed_qkv = mixed_qkv[:num_actual_tokens]
+            b_prep = b_prep[:num_actual_tokens]
+            a_prep = a_prep[:num_actual_tokens]
             return self._forward_core_decode_non_spec(
                 mixed_qkv=mixed_qkv,
-                b=b,
-                a=a,
+                b=b_prep,
+                a=a_prep,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
             )
@@ -808,12 +920,19 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             else self_kv_cache[0].transpose(-1, -2)
         )
         ssm_state = self_kv_cache[1]
-        num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
-        b = b[:num_actual_tokens]
-        a = a[:num_actual_tokens]
+        if spec_sequence_masks is not None or attn_metadata.num_prefills > 0:
+            num_tokens_all = qkvz.shape[0]
+            mixed_qkv, z, b, a = self.prepare_gdn_attention_core_inputs(
+                qkvz, ba, num_tokens_all
+            )
+            z_out[:] = z
+            mixed_qkv = mixed_qkv[:num_actual_tokens]
+            b = b[:num_actual_tokens]
+            a = a[:num_actual_tokens]
+        else:
+            mixed_qkv, b, a = None, None, None
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -827,9 +946,12 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        else:
+        elif attn_metadata.num_prefills > 0:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+        else:
+            mixed_qkv_spec = None
+            mixed_qkv_non_spec = None
 
         # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -866,18 +988,37 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
-            assert mixed_qkv_non_spec is not None
-            mixed_qkv_non_spec = causal_conv1d_update(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_actual_tokens
-                ],
-                validate_data=True,
-            )
+            if mixed_qkv_non_spec is not None:
+                mixed_qkv_non_spec = causal_conv1d_update_fast(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                    validate_data=True,
+                )
+            else:
+                mixed_qkv_non_spec, b, a = fused_reshape_causal_conv1d_update_fast(
+                    qkvz,
+                    num_actual_tokens,
+                    self.num_k_heads // self.tp_size,
+                    self.num_v_heads // self.tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                    ba,
+                    z_out,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                    validate_data=True,
+                )
         else:
             mixed_qkv_non_spec = None
 
@@ -923,19 +1064,25 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             g_non_spec = None
             beta_non_spec = None
 
+        core_attn_flat = (
+            core_attn_out.reshape(-1) if spec_sequence_masks is None else None
+        )
+
         # 2. Recurrent attention
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
+                fused_rearrange_sigmoid_gated_delta_rule(
                     A_log=self.A_log,
                     a=a,
                     b=b,
                     dt_bias=self.dt_bias,
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
+                    qkv=mixed_qkv_spec,
+                    key_dim=self.key_dim // self.tp_size,
+                    value_dim=self.value_dim // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=spec_query_start_loc[
@@ -944,6 +1091,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    core_attn_out=None,
                 )
             )
         else:
@@ -968,6 +1116,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
+                core_attn_out=core_attn_flat,
             )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
@@ -975,14 +1124,16 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
-                fused_sigmoid_gating_delta_rule_update(
+                fused_rearrange_sigmoid_gated_delta_rule(
                     A_log=self.A_log,
                     a=a,
                     b=b,
                     dt_bias=self.dt_bias,
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
+                    qkv=mixed_qkv_non_spec,
+                    key_dim=self.key_dim // self.tp_size,
+                    value_dim=self.value_dim // self.tp_size,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[
@@ -990,6 +1141,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
+                    core_attn_out=core_attn_flat,
                 )
             )
         else:
@@ -1007,8 +1159,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_core_decode_non_spec(
         self,
@@ -1033,14 +1183,10 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
-        b = b[:num_actual_tokens]
-        a = a[:num_actual_tokens]
-
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        mixed_qkv_non_spec = causal_conv1d_update(
+        mixed_qkv_non_spec = causal_conv1d_update_fast(
             mixed_qkv,
             conv_state,
             conv_weights,
@@ -1066,9 +1212,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
 
 
 def gdn_attention_core(
-    mixed_qkv: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
+    projected_qkvz: torch.Tensor,
+    projected_ba: torch.Tensor,
+    z: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -1080,17 +1226,17 @@ def gdn_attention_core(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     self._forward_core(
-        mixed_qkv=mixed_qkv,
-        b=b,
-        a=a,
+        qkvz=projected_qkvz,
+        ba=projected_ba,
+        z_out=z,
         core_attn_out=core_attn_out,
     )
 
 
 def gdn_attention_core_fake(
-    mixed_qkv: torch.Tensor,
-    b: torch.Tensor,
-    a: torch.Tensor,
+    projected_qkvz: torch.Tensor,
+    projected_ba: torch.Tensor,
+    z: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
@@ -1101,7 +1247,7 @@ def gdn_attention_core_fake(
 direct_register_custom_op(
     op_name="gdn_attention_core",
     op_func=gdn_attention_core,
-    mutates_args=["core_attn_out"],
+    mutates_args=["z", "core_attn_out"],
     fake_impl=gdn_attention_core_fake,
 )
 
