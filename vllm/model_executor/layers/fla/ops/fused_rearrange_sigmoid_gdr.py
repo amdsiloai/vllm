@@ -269,8 +269,6 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     num_stages = 3
     num_warps = 4
 
-    # o = q.new_empty(NK, *v.shape)
-    # o = qkv.new_empty(NK, B, T, HV, V)
     o = (
         core_attn_out[: NK * B * T * HV * V].view(NK, B, T, HV, V)
         if core_attn_out is not None
