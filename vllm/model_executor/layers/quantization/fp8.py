@@ -10,6 +10,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -45,6 +46,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    W8A8BlockFp8LinearOp,
     create_fp8_input_scale,
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -286,6 +288,7 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
+        self.w8a8_block_fp8_linear: W8A8BlockFp8LinearOp | None = None
 
         if self.block_quant:
             assert not self.act_q_static
@@ -383,6 +386,16 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
+        if self.block_quant and not self.use_marlin:
+            assert self.weight_block_size is not None
+            self.w8a8_block_fp8_linear = W8A8BlockFp8LinearOp(
+                weight_group_shape=GroupShape(*self.weight_block_size),
+                act_quant_group_shape=GroupShape(1, self.weight_block_size[0]),
+                cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
+                use_aiter_and_is_supported=rocm_aiter_ops.is_linear_fp8_enabled(),
+                use_deep_gemm=self.use_deep_gemm,
+            )
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.use_marlin:
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
@@ -433,16 +446,23 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        rms_norm_parameters: dict | None = None,
     ) -> torch.Tensor:
         # if batch invariant mode is enabled, prefer DeepGEMM FP8 path
         # we will use BF16 dequant when DeepGEMM is not supported.
         if envs.VLLM_BATCH_INVARIANT:
             if self.block_quant:
                 assert self.weight_block_size is not None
-                return self.fp8_linear.apply_weights(
-                    layer,
-                    x,
-                    bias,
+                if self.use_marlin:
+                    return self.fp8_linear.apply_weights(layer, x, bias)
+                assert self.w8a8_block_fp8_linear is not None
+                return self.w8a8_block_fp8_linear.apply(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                    rms_norm_parameters=rms_norm_parameters,
                 )
             else:
                 # per-tensor/channel: dequant to BF16 and run GEMM
@@ -470,6 +490,18 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_marlin:
             return self.fp8_linear.apply_weights(layer, x, bias)
+
+        if self.block_quant:
+            assert self.weight_block_size is not None
+            assert self.w8a8_block_fp8_linear is not None
+            return self.w8a8_block_fp8_linear.apply(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=layer.input_scale,
+                bias=bias,
+                rms_norm_parameters=rms_norm_parameters,
+            )
 
         return self.fp8_linear.apply_weights(layer, x, bias)
 

@@ -12,11 +12,15 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
     get_fp8_min_max,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    CUTLASS_BLOCK_FP8_SUPPORTED,
     all_close_1d,
     per_tensor_dequantize,
 )
@@ -31,7 +35,13 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
+    is_deep_gemm_supported,
+    should_use_deepgemm_for_fp8_linear,
     transform_sf_into_required_layout,
+)
+from vllm.utils.flashinfer import (
+    is_flashinfer_fp8_blockscale_gemm_supported,
+    should_use_flashinfer_for_blockscale_fp8_gemm,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -75,6 +85,276 @@ direct_register_custom_op(
     _triton_per_token_group_quant_fp8_impl,
     fake_impl=_triton_per_token_group_quant_fp8_fake,
 )
+
+
+def cutlass_scaled_mm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    return ops.cutlass_scaled_mm(
+        A,
+        B.T,
+        out_dtype=output_dtype,
+        scale_a=As,
+        scale_b=Bs.T,
+    )
+
+
+# TODO fix ROCm->Triton custom path:
+#  https://github.com/vllm-project/vllm/issues/14397
+class W8A8BlockFp8LinearOp:
+    """
+    This class executes a Blocked FP8 linear layer using cutlass if supported
+    and torch.scaled_mm otherwise.
+    """
+
+    def __init__(
+        self,
+        weight_group_shape: GroupShape,
+        act_quant_group_shape: GroupShape,
+        cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
+        use_aiter_and_is_supported: bool = False,
+        use_deep_gemm: bool | None = None,
+    ):
+        self.weight_group_shape = weight_group_shape
+        self.act_quant_group_shape = act_quant_group_shape
+        if use_deep_gemm is not None:
+            self.is_deep_gemm_supported = use_deep_gemm
+        else:
+            self.is_deep_gemm_supported = is_deep_gemm_supported()
+        self.is_hopper = current_platform.is_device_capability(90)
+        self.use_deep_gemm_e8m0 = is_deep_gemm_e8m0_used()
+        self.is_flashinfer_supported = is_flashinfer_fp8_blockscale_gemm_supported()
+
+        # Get the correct blockscale mul and input quant operations.
+        # We can't use _dispatch_w8a8_blockscale_op to figure out if we want
+        # to use deepgemm because we don't know the shape of weights (and
+        # whether deepgemm supports it) at the init time.
+        self.w8a8_blockscale_op, self.input_quant_op = (
+            self._dispatch_w8a8_blockscale_op(
+                cutlass_block_fp8_supported, use_aiter_and_is_supported
+            )
+        )
+        self.deepgemm_input_quant_op = (
+            QuantFP8(
+                False,
+                self.act_quant_group_shape,
+                column_major_scales=True,
+                tma_aligned_scales=envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
+                use_ue8m0=self.use_deep_gemm_e8m0,
+            )
+            if self.is_deep_gemm_supported
+            else None
+        )
+
+    def apply(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        rms_norm_parameters: dict | None = None,
+    ) -> torch.Tensor:
+        assert input_scale is None
+        # View input as 2D matrix for fp8 methods
+        input_2d = input.view(-1, input.shape[-1])
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+        output_dtype = input.dtype
+
+        if should_use_flashinfer_for_blockscale_fp8_gemm(
+            self.is_flashinfer_supported,
+            output_dtype,
+            input_2d.dtype,
+            weight.dtype,
+            weight.shape,
+        ) and should_use_deepgemm_for_fp8_linear(
+            output_dtype,
+            weight.shape,
+            self.is_deep_gemm_supported,
+        ):
+            output = self._run_flashinfer(input_2d, weight, weight_scale)
+
+        elif should_use_deepgemm_for_fp8_linear(
+            output_dtype,
+            weight.shape,
+            self.is_deep_gemm_supported,
+        ):
+            output = self._run_deepgemm(input_2d, weight, weight_scale)
+        else:
+            output = self.w8a8_blockscale_op(
+                input_2d, weight, weight_scale, input_scale, rms_norm_parameters
+            )
+
+        if bias is not None:
+            output = output + bias
+        return output.to(dtype=input.dtype).view(*output_shape)
+
+    def _run_deepgemm(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.deepgemm_input_quant_op is not None
+        q_input, input_scale = self.deepgemm_input_quant_op(input_2d)
+        output = torch.empty(
+            (q_input.shape[0], weight.shape[0]),
+            dtype=torch.bfloat16,
+            device=q_input.device,
+        )
+        torch.ops.vllm.fp8_gemm_nt_op(
+            q_input, input_scale, weight, weight_scale, output, self.use_deep_gemm_e8m0
+        )
+        return output
+
+    def _run_cutlass(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+        rms_norm_parameters: dict | None = None,
+    ) -> torch.Tensor:
+        assert input_scale is None
+        assert self.input_quant_op is not None
+        q_input, input_scale = self.input_quant_op(
+            input_2d, rms_norm_parameters=rms_norm_parameters
+        )
+        if self.is_hopper:
+            return torch.ops.vllm.padded_cutlass(
+                q_input,
+                weight,
+                input_scale,
+                weight_scale,
+                list(self.weight_group_shape),
+                input_2d.dtype,
+            )
+        else:
+            return cutlass_scaled_mm(
+                q_input,
+                weight,
+                input_scale,
+                weight_scale,
+                list(self.weight_group_shape),
+                input_2d.dtype,
+            )
+
+    def _run_aiter(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+        rms_norm_parameters: dict | None = None,
+    ) -> torch.Tensor:
+        assert self.act_quant_group_shape == GroupShape(1, 128)
+
+        n, k = weight.shape
+
+        use_triton = (
+            not current_platform.is_fp8_fnuz()
+            and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
+        )
+
+        if use_triton:
+            gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
+        else:
+            gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale
+
+        if input_scale is not None:
+            q_input = input_2d
+        else:
+            q_input, input_scale = self.input_quant_op(
+                input_2d,
+                rms_norm_parameters=rms_norm_parameters,
+                use_triton=use_triton,
+            )
+
+        return gemm_a8w8_blockscale_op(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            list(self.weight_group_shape),
+            output_dtype=input_2d.dtype,
+        )
+
+    def _run_triton(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+        rms_norm_parameters: dict | None = None,
+    ) -> torch.Tensor:
+        assert input_scale is None
+        assert self.input_quant_op is not None
+        q_input, input_scale = self.input_quant_op(
+            input_2d, rms_norm_parameters=rms_norm_parameters
+        )
+        return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            list(self.weight_group_shape),
+            input_2d.dtype,
+        )
+
+    def _run_flashinfer(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run FlashInfer FP8 block-scale GEMM.
+
+        This backend uses TensorRT-LLM's FP8 block-scale GEMM kernels
+        and supports FP8+FP8 (W8A8 full quantization) on SM90+ (Hopper).
+        """
+        return torch.ops.vllm.dynamic_flashinfer_deepgemm_blockscale_gemm(
+            input_2d,
+            weight,
+            weight_scale,
+            self.act_quant_group_shape.col,
+            self.use_deep_gemm_e8m0,
+        )
+
+    def _dispatch_w8a8_blockscale_op(
+        self,
+        use_cutlass: bool,
+        use_aiter_and_is_supported: bool,
+    ) -> tuple[Callable[..., torch.Tensor], QuantFP8]:
+        if use_cutlass:
+            return self._run_cutlass, (
+                QuantFP8(
+                    False,
+                    self.act_quant_group_shape,
+                    column_major_scales=True,
+                    use_ue8m0=False,
+                )
+            )
+        if use_aiter_and_is_supported:
+            return self._run_aiter, QuantFP8(
+                False,
+                self.act_quant_group_shape,
+                column_major_scales=False,
+                use_ue8m0=False,
+            )
+        return self._run_triton, (
+            QuantFP8(
+                False,
+                self.act_quant_group_shape,
+                column_major_scales=False,
+                use_ue8m0=False,
+            )
+        )
 
 
 def input_to_float8(
