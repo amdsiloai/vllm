@@ -145,9 +145,9 @@ def inject_shared_expert_weights(
         topk_ids = total_topk_ids_slice
 
     if shared_expert_weights is not None:
-        topk_weights[:, topk : topk + num_fused_shared_experts] = (
-            shared_expert_weights[:token]
-        )
+        topk_weights[:, topk : topk + num_fused_shared_experts] = shared_expert_weights[
+            :token
+        ]
 
     return topk_weights, topk_ids
 
@@ -240,6 +240,7 @@ def rocm_aiter_fused_experts(
     num_local_tokens: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     moe_sorting_dispatch_policy: int = 0,
+    moe_buf: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ROCm AITER fused MoE expert computation."""
     if quant_config is None:
@@ -355,6 +356,7 @@ def rocm_aiter_fused_experts(
             bias1=quant_config.w1_bias if quant_config.use_mxfp4_w4a16 else None,
             bias2=quant_config.w2_bias if quant_config.use_mxfp4_w4a16 else None,
             moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            moe_buf=moe_buf,
         )
 
 
@@ -468,7 +470,7 @@ class AiterExperts(mk.FusedMoEExpertsModular):
         else:
             num_local_tokens = None
 
-        result = rocm_aiter_fused_experts(
+        rocm_aiter_fused_experts(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -483,5 +485,5 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             num_local_tokens=num_local_tokens,
             output_dtype=output.dtype,
             moe_sorting_dispatch_policy=envs.VLLM_ROCM_AITER_MOE_DISPATCH_POLICY,
+            moe_buf=output,
         )
-        output.data = result
